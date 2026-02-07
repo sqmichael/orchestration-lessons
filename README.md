@@ -217,6 +217,40 @@ The gemini CLI docs say `-p` is "appended to input on stdin" — this is the int
 
 ---
 
+## Lesson 12: Shell Helper Functions Have Hidden Input Limits
+
+**What happened:** The `deepseek()` shell function used `read -r` to accept stdin when no positional argument was given. The DeepSeek architecture review hook piped a multiline prompt via `echo "$PROMPT" | deepseek`. `read -r` only reads ONE line — the review model received "Review this diff to architecture-sensitive files in a voice AI system. Check for:" and nothing else. The actual diff, instructions, and output format were silently dropped.
+
+**Why:** `read -r` is designed for single-line input. It stops at the first newline. For multiline content, `cat` or `mapfile` is needed. The function worked in quick tests (single-line prompts) but broke on real multi-line review prompts.
+
+**Specific pattern:**
+```bash
+# BAD — read -r drops everything after first newline
+my_model() {
+  local prompt="$1"
+  [[ -z "$prompt" ]] && { read -r prompt; }  # ← only gets line 1
+  call_api "$prompt"
+}
+
+# GOOD — cat reads all stdin
+my_model() {
+  local prompt="$1"
+  [[ -z "$prompt" ]] && { prompt=$(cat); }  # ← gets everything
+  call_api "$prompt"
+}
+```
+
+**Broader lesson:** Each tool in the chain has its own input method with its own limits:
+- Shell args → 128KB (ARG_MAX)
+- `read -r` → first line only
+- gemini `-p` flag → garbles at >20KB
+- Codex CLI → can read files from sandbox
+- curl JSON body → no practical limit (HTTP POST)
+
+**Rule: Document and test the input method for every external model call. "It works in quick tests" ≠ "it works in production."**
+
+---
+
 ## Implementation Checklist
 
 When setting up a multi-agent coding workflow:
