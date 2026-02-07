@@ -122,6 +122,69 @@ def test_conversation_reads_id_not_person_id():
 
 ---
 
+## Lesson 8: Seam Audits Are Not Optional After Multi-File Changes
+
+**What happened:** A 6-file feature implementation (v8 state machine) passed all 414 unit tests and Codex diff review. Three bugs survived:
+1. A sync function couldn't `await` an async dependency — MATCHING state never fetched match suggestions
+2. A `.format()` template used `{{{{` (quadruple braces) producing `{{` instead of `{` — LLM received malformed JSON examples
+3. A type annotation said `DialogStage` but callers passed `ConversationStage` — no crash, but misleading for tools and reviewers
+
+**Why:** Unit tests test each module with mock data. Diff reviews check each hunk in isolation. Neither traces a call chain end-to-end across module boundaries. The bugs live *between* the modules — at the seams.
+
+**Fix:** After any change touching >3 files, perform a manual seam audit:
+1. List every function call that crosses a module boundary
+2. For each cross-module call, verify: argument types match parameter types, return types match what the caller expects
+3. For each shared data structure, verify: producer keys match consumer reads
+4. For async code, verify: the full call chain supports `await` if any leaf function is async
+5. For string templates, verify: rendered output has balanced braces/brackets (test the actual `.format()` result)
+
+**Rule: Tests check components. Reviews check diffs. Seam audits check integration. All three are needed.**
+
+---
+
+## Lesson 9: Lessons Applied Locally Get Replicated Globally
+
+**What happened:** Lesson 2 fixed `review-gate.sh` to require non-empty proof (`.review-output-{DIFF_HASH}` with `-s` check). Then three more gates were written afterward — `push-gate.sh`, `core-gate.sh`, and the PASS paths in `codex-review.sh` and `deepseek-arch-review.sh` — all using `touch` (empty boolean markers). The exact anti-pattern Lesson 2 warned about was replicated in every subsequent gate.
+
+**Why:** The lesson was applied to the specific file where the bug occurred (`review-gate.sh`) but not encoded as a principle that applies to all future gates. New hooks were written by different agents in different sessions — none knew about Lesson 2.
+
+**Fix:** When you learn a lesson, encode it in two places:
+1. The specific fix (patch the broken code)
+2. A general rule in your instructions/CLAUDE.md (prevent recurrence in new code)
+
+Audit existing code for the same pattern. If `review-gate.sh` was fixed but `push-gate.sh` wasn't, the lesson wasn't learned — it was just patched.
+
+**Rule: A lesson applied to one file but not generalized is a patch, not a lesson.**
+
+---
+
+## Lesson 10: Async/Sync Boundary Bugs Are Silent
+
+**What happened:** `_check_v8_stage_transition` was a sync function called from an async context. It worked — Python allows this. But when the MATCHING state needed to fetch match suggestions via `await _fetch_match_suggestions()`, it couldn't. The `await` keyword is invalid in a sync function. The match suggestions were simply never fetched.
+
+**Why:** Python doesn't warn when you call a sync function from an async context. The sync function runs, returns, and nothing breaks — unless that function needs to call other async code. The bug is invisible until you trace the full dependency chain.
+
+**Specific trap:**
+```python
+# This works fine
+async def caller():
+    result = sync_function()  # No error
+
+# But sync_function can't do this:
+def sync_function():
+    data = await async_dependency()  # SyntaxError
+    # So it either skips the call or was never written to make it
+```
+
+**Fix:** When writing or reviewing functions in an async codebase:
+- If a function calls ANY async dependency (directly or transitionally), it must be `async def`
+- When adding new async calls to existing sync functions, you must convert them to async and update all callers
+- Add a seam-audit check: "Does this sync function need to call anything async?"
+
+**Rule: In async codebases, sync functions are dependency dead-ends. Verify the full call chain supports async before assuming a sync function can do its job.**
+
+---
+
 ## Implementation Checklist
 
 When setting up a multi-agent coding workflow:
@@ -133,12 +196,15 @@ When setting up a multi-agent coding workflow:
 - [ ] **Contract tests for shared data shapes** — producer keys match consumer reads
 - [ ] **Convergence review after parallel tracks** — check integration points explicitly
 - [ ] **External model review before commit** — different model than the author
+- [ ] **Seam audit after multi-file changes** — trace call chains across module boundaries
+- [ ] **Lessons generalized, not just patched** — audit existing code for same anti-pattern
+- [ ] **Async chain verification** — if any leaf is async, the full call chain must be async
 
 ---
 
 ## Cost of Not Doing This
 
-From one 6-hour session on a medium-complexity feature:
+### Session 1: Package F (6-hour session, medium-complexity feature)
 
 | Bug | Severity | Root Cause | Would Have Caught |
 |-----|----------|-----------|-------------------|
@@ -149,4 +215,16 @@ From one 6-hour session on a medium-complexity feature:
 | Silent exception swallowing | MEDIUM | Defensive coding without logging | External review |
 | Conflicting instruction rules | MEDIUM | Prompt rewrite inconsistency | External review |
 
-All 6 bugs were caught before reaching production. Without these gates, they would have shipped as silent failures — features that "work" but never return data.
+### Session 2: v8 State Machine (single session, 6-file feature)
+
+| Bug | Severity | Root Cause | Would Have Caught |
+|-----|----------|-----------|-------------------|
+| Sync function can't await async dep | HIGH | Function wasn't made async | Seam audit |
+| `.format()` template malformed JSON | HIGH | Quadruple braces instead of double | Seam audit, template render test |
+| Missing match_suggestions fetch | HIGH | v8 path didn't call existing fetch function | Seam audit |
+| Regex case sensitivity (3 instances) | MEDIUM | Patterns had uppercase `I`, input was lowercased | External review (Codex caught 2) |
+| Type annotation mismatch | LOW | `DialogStage` annotation, `ConversationStage` passed | mypy, seam audit |
+
+**Key finding:** Session 2 had all the gates from Session 1 in place (Codex review, pytest, DeepSeek arch review). The 3 HIGH bugs still survived — they required a manual seam audit to find. External review is necessary but insufficient for multi-file changes.
+
+All bugs were caught before reaching production.
