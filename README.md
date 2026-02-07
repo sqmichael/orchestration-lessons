@@ -185,6 +185,38 @@ def sync_function():
 
 ---
 
+## Lesson 11: CLI Tools Silently Corrupt Large Inputs
+
+**What happened:** The Gemini seam audit hook passed prompts via `-p "$VARIABLE"`. At ~20KB, the model returned garbled nonsense — random words, hallucinated bash scripts, single-character outputs. At ~140KB, the OS rejected the command with `Argument list too long`. Exit code was 0 in both cases. No error message.
+
+**Why:** Two separate failure modes compound:
+1. **Shell variable escaping** — When a shell variable containing code (braces, quotes, backslashes) is passed as a CLI argument, the shell interprets special characters. At small sizes this works; at large sizes the corruption accumulates.
+2. **OS argument length limit** — `MAX_ARG_STRLEN` on Linux x86_64 is 128KB per argument. `$(cat bigfile)` as a command argument hits this hard limit.
+
+**Specific symptoms by size:**
+- <10KB: Works fine
+- 20-50KB: Returns but response is garbled (model received corrupted input)
+- 50-128KB: Sometimes works, sometimes garbled (depends on content)
+- >128KB: `Argument list too long` (OS rejection)
+
+**Fix:** Split instruction from content:
+```bash
+# BAD — breaks at scale
+gemini -p "$LARGE_PROMPT" -o text
+
+# BAD — hits ARG_MAX
+gemini -p "$(cat bigfile)" -o text
+
+# GOOD — stdin for content, -p for instruction
+cat content.txt | gemini -p "Short instruction here" -o text
+```
+
+The gemini CLI docs say `-p` is "appended to input on stdin" — this is the intended pattern. Content on stdin, instruction via `-p`.
+
+**Rule: Always test CLI tools at production-scale input sizes. Silent corruption is worse than a crash.**
+
+---
+
 ## Implementation Checklist
 
 When setting up a multi-agent coding workflow:
@@ -199,6 +231,7 @@ When setting up a multi-agent coding workflow:
 - [ ] **Seam audit after multi-file changes** — trace call chains across module boundaries
 - [ ] **Lessons generalized, not just patched** — audit existing code for same anti-pattern
 - [ ] **Async chain verification** — if any leaf is async, the full call chain must be async
+- [ ] **CLI tools tested at scale** — test with production-sized inputs, not toy examples
 
 ---
 
